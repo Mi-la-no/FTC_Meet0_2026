@@ -1,331 +1,393 @@
 
 package org.firstinspires.ftc.teamcode.pedroPathing;
 
+import com.pedropathing.follower.Follower;
+import com.pedropathing.geometry.Pose;
+
 import com.qualcomm.hardware.limelightvision.LLResult;
 import com.qualcomm.hardware.limelightvision.LLResultTypes;
 import com.qualcomm.hardware.limelightvision.Limelight3A;
-import com.qualcomm.hardware.rev.RevHubOrientationOnRobot;
 import com.qualcomm.robotcore.eventloop.opmode.Autonomous;
-import com.qualcomm.robotcore.eventloop.opmode.LinearOpMode;
-import com.qualcomm.robotcore.hardware.DcMotor;
-import com.qualcomm.robotcore.hardware.IMU;
+import com.qualcomm.robotcore.eventloop.opmode.OpMode;
+import com.qualcomm.robotcore.eventloop.opmode.TeleOp;
 import com.qualcomm.robotcore.util.ElapsedTime;
 import com.qualcomm.robotcore.util.Range;
 
-import org.firstinspires.ftc.robotcore.external.navigation.AngleUnit;
-
 import java.util.List;
 
-@Autonomous(name = "Pollen Search Auto", group = "Autonomous")
-public class Limelight extends LinearOpMode {
+@TeleOp(name = "Pollen Search Auto", group = "Autonomous")
+public class Limelight extends OpMode {
 
-    // CHANGE these names to match your Robot Configuration.
-    private DcMotor frontLeft;
-    private DcMotor frontRight;
-    private DcMotor backLeft;
-    private DcMotor backRight;
-
+    private Follower follower;
     private Limelight3A limelight;
-    private IMU imu;
-
-    // Leave a safety margin before the 30-second period ends.
-    private static final double AUTO_LIMIT_SECONDS = 26.0;
-
-    // Search settings
-    private static final double SCAN_SAMPLE_SECONDS = 0.40;
-    private static final double DRIVE_POWER = 0.25;
-    private static final double DRIVE_STEP_SECONDS = 1.20;
-
-    // Turn settings
-    private static final double TURN_KP = 0.012;
-    private static final double MAX_TURN_POWER = 0.25;
-    private static final double MIN_TURN_POWER = 0.10;
-    private static final double TURN_TOLERANCE_DEGREES = 3.0;
 
     private final ElapsedTime autoTimer = new ElapsedTime();
+    private final ElapsedTime stateTimer = new ElapsedTime();
+    private final ElapsedTime lostTimer = new ElapsedTime();
+
+    private enum SearchState {
+        SEARCHING,
+        CONFIRMING,
+        TRACKING
+    }
+
+    private SearchState state = SearchState.SEARCHING;
+
+    // Search behavior
+    private static final double SEARCH_TURN = -0.10;
+    private static final double CONFIRM_SECONDS = 0.45;
+    private static final double LOST_GRACE_SECONDS = 0.80;
+
+    // Faster movement
+    private static final double FORWARD_POWER = 0.34;
+    private static final double ALIGN_POWER = 0.22;
+    private static final double TURNING_FORWARD_POWER = 0.14;
+
+    // Vision steering
+    private static final double TURN_KP = 0.015;
+    private static final double MAX_TURN = 0.28;
+    private static final double LEFT_BOUNDARY = -6.0;
+    private static final double RIGHT_BOUNDARY = 6.0;
+    private static final double CENTER_TOLERANCE = 2.0;
+
+    private double lastTargetAngle = 0.0;
+    private double lastForwardCommand = 0.0;
+    private double lastTurnCommand = 0.0;
+
+    private boolean sawPollenDuringConfirmation = false;
+
+    // Summary of every Pollen detection in one Limelight result.
+    private static class VisionObservation {
+        int pollenCount = 0;
+        int leftCount = 0;
+        int centerCount = 0;
+        int rightCount = 0;
+
+        double leftAngleSum = 0.0;
+        double centerAngleSum = 0.0;
+        double rightAngleSum = 0.0;
+
+        int rawDetectionCount = 0;
+        double targetAngle = 0.0;
+        int bestSectorCount = 0;
+        String bestSector = "NONE";
+    }
 
     @Override
-    public void runOpMode() {
+    public void init() {
 
-        // Initialize mecanum motors.
-        frontLeft = hardwareMap.get(DcMotor.class, "front_left_drive");
-        frontRight = hardwareMap.get(DcMotor.class, "front_right_drive");
-        backLeft = hardwareMap.get(DcMotor.class, "back_left_drive");
-        backRight = hardwareMap.get(DcMotor.class, "back_right_drive");
+        // Reuse the same drivetrain configuration as your TeleOp.
+        follower = Constants.createFollower(hardwareMap);
 
-        // Standard mecanum setup: reverse the left motors.
-        frontLeft.setDirection(DcMotor.Direction.REVERSE);
-        backLeft.setDirection(DcMotor.Direction.REVERSE);
+        follower.setStartingPose(
+                Teleop.startingPose == null
+                        ? new Pose()
+                        : Teleop.startingPose
+        );
 
-        frontLeft.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
-        frontRight.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
-        backLeft.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
-        backRight.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
+        follower.update();
 
-        // Initialize the Control Hub IMU.
-        imu = hardwareMap.get(IMU.class, "imu");
+        // Use ONLY the Limelight neural detector.
+        limelight = hardwareMap.get(
+                Limelight3A.class, "limelight");
 
-        RevHubOrientationOnRobot orientation =
-                new RevHubOrientationOnRobot(
-                        RevHubOrientationOnRobot.LogoFacingDirection.UP,
-                        RevHubOrientationOnRobot.UsbFacingDirection.FORWARD
-                );
-
-        imu.initialize(new IMU.Parameters(orientation));
-
-        // Use your existing Limelight neural detector pipeline.
-        limelight = hardwareMap.get(Limelight3A.class, "limelight");
+        // Pipeline 0 must be your trained neural detector.
         limelight.pipelineSwitch(0);
         limelight.start();
 
         telemetry.addLine("Pollen Search Auto Ready");
-        telemetry.addLine("Check motor names and IMU orientation.");
-        telemetry.addLine("Press PLAY to begin.");
+        telemetry.addLine("PedroPathing drivetrain initialized");
+        telemetry.addLine("Limelight neural detector enabled");
+        telemetry.addLine("No internal autonomous time cutoff");
         telemetry.update();
+    }
 
-        waitForStart();
+    @Override
+    public void start() {
+        follower.startTeleopDrive();
 
-        if (!opModeIsActive()) {
-            stopDrive();
-            limelight.stop();
-            return;
-        }
-
-        imu.resetYaw();
         autoTimer.reset();
+        stateTimer.reset();
+        lostTimer.reset();
 
-        // Four headings relative to the robot's starting direction.
-        double[] headings = {0.0, 90.0, 180.0, -90.0};
-
-        while (opModeIsActive()
-                && autoTimer.seconds() < AUTO_LIMIT_SECONDS) {
-
-            double bestHeading = 0.0;
-            double bestScore = -1.0;
-            boolean scanSuccessful = true;
-
-            // Scan four directions and measure visible Pollen.
-            for (double heading : headings) {
-
-                if (!opModeIsActive()
-                        || autoTimer.seconds() >= AUTO_LIMIT_SECONDS) {
-                    scanSuccessful = false;
-                    break;
-                }
-
-                if (!turnToHeading(heading)) {
-                    scanSuccessful = false;
-                    break;
-                }
-
-                // Allow the camera view to settle after turning.
-                sleep(100);
-
-                double score = samplePollenScore();
-
-                telemetry.addData("Scanned Heading", heading);
-                telemetry.addData("Pollen Score", "%.2f", score);
-                telemetry.update();
-
-                if (score > bestScore) {
-                    bestScore = score;
-                    bestHeading = heading;
-                }
-            }
-
-            stopDrive();
-
-            if (!scanSuccessful) {
-                break;
-            }
-
-            if (!opModeIsActive()
-                    || autoTimer.seconds() >= AUTO_LIMIT_SECONDS) {
-                break;
-            }
-
-            // Face the direction with the largest average Pollen count.
-            if (!turnToHeading(bestHeading)) {
-                break;
-            }
-
-            // If nothing was detected, take a shorter exploratory step.
-            // Otherwise move toward the most promising visible cluster.
-            double stepSeconds =
-                    bestScore > 0.0 ? DRIVE_STEP_SECONDS : 0.80;
-
-            driveForwardFor(stepSeconds);
-
-            stopDrive();
-
-            telemetry.addData("Chosen Heading", bestHeading);
-            telemetry.addData("Best Pollen Score", "%.2f", bestScore);
-            telemetry.addData("Autonomous Time", "%.1f s",
-                    autoTimer.seconds());
-            telemetry.update();
-        }
-
-        stopDrive();
-        limelight.stop();
+        state = SearchState.SEARCHING;
     }
 
-    // Average the number of Pollen detections during a short scan.
-    private double samplePollenScore() {
+    @Override
+    public void loop() {
 
-        ElapsedTime sampleTimer = new ElapsedTime();
+        follower.update();
 
-        double totalCount = 0.0;
-        int samples = 0;
+        VisionObservation vision = readPollen();
 
-        while (opModeIsActive()
-                && sampleTimer.seconds() < SCAN_SAMPLE_SECONDS
-                && autoTimer.seconds() < AUTO_LIMIT_SECONDS) {
+        double forward = 0.0;
+        double turn = 0.0;
+        String behavior;
 
-            totalCount += countPollen();
-            samples++;
+        switch (state) {
 
-            sleep(50);
+            case SEARCHING:
+
+                // Rotate slowly until Pollen enters the camera view.
+                if (vision.pollenCount > 0) {
+
+                    lastTargetAngle = vision.targetAngle;
+
+                    // Stop searching and pause to confirm the detection.
+                    state = SearchState.CONFIRMING;
+                    stateTimer.reset();
+
+                    sawPollenDuringConfirmation = true;
+                    lostTimer.reset();
+
+                    behavior = "Pollen found - pausing to confirm";
+                } else {
+
+                    forward = 0.0;
+                    turn = SEARCH_TURN;
+
+                    behavior = "Searching for Pollen";
+                }
+
+                break;
+
+            case CONFIRMING:
+
+                // Remain still during the confirmation period.
+                forward = 0.0;
+                turn = 0.0;
+
+                if (vision.pollenCount > 0) {
+                    sawPollenDuringConfirmation = true;
+                    lastTargetAngle = vision.targetAngle;
+                    lostTimer.reset();
+                }
+
+                if (stateTimer.seconds() >= CONFIRM_SECONDS) {
+
+                    if (sawPollenDuringConfirmation) {
+
+                        state = SearchState.TRACKING;
+                        lostTimer.reset();
+
+                        behavior = "Pollen confirmed - approaching";
+
+                    } else {
+
+                        state = SearchState.SEARCHING;
+
+                        behavior = "Detection not confirmed";
+                    }
+
+                } else {
+
+                    behavior = "Waiting for stable detection";
+                }
+
+                break;
+
+            case TRACKING:
+
+                if (vision.pollenCount > 0) {
+
+                    // Use the freshest location estimate from the camera.
+                    lastTargetAngle = vision.targetAngle;
+                    lostTimer.reset();
+
+                    double angleError =
+                            Math.abs(lastTargetAngle);
+
+                    // Keep turning toward Pollen while making progress.
+                    turn = -Range.clip(
+                            lastTargetAngle * TURN_KP,
+                            -MAX_TURN,
+                            MAX_TURN
+                    );
+
+                    if (angleError < CENTER_TOLERANCE) {
+                        turn = 0.0;
+                    }
+
+                    // Drive faster when the target is near the center.
+                    // Continue moving slowly while making large turns.
+                    if (angleError > 25.0) {
+
+                        forward = TURNING_FORWARD_POWER;
+                        behavior = "Turning toward Pollen";
+
+                    } else if (angleError > 10.0) {
+
+                        forward = ALIGN_POWER;
+                        behavior = "Aligning and approaching";
+
+                    } else {
+
+                        forward = FORWARD_POWER;
+                        behavior = "Approaching Pollen";
+                    }
+
+                } else {
+
+                    // Do NOT immediately resume spinning when a detection
+                    // briefly disappears. Hold position and wait to reacquire.
+                    forward = 0.0;
+                    turn = 0.0;
+
+                    if (lostTimer.seconds() >= LOST_GRACE_SECONDS) {
+
+                        state = SearchState.SEARCHING;
+
+                        behavior = "Pollen lost - resuming search";
+
+                    } else {
+
+                        behavior = "Detection lost - waiting to reacquire";
+                    }
+                }
+
+                break;
+
+            default:
+
+                state = SearchState.SEARCHING;
+                behavior = "Resetting search";
+                break;
         }
 
-        if (samples == 0) {
-            return 0.0;
-        }
+        lastForwardCommand = forward;
+        lastTurnCommand = turn;
 
-        return totalCount / samples;
+        // Use the working PedroPathing mecanum drivetrain.
+        follower.setTeleOpDrive(
+                forward,
+                0.0,
+                turn,
+                false
+        );
+
+        telemetry.addData("State", state);
+        telemetry.addData("Behavior", behavior);
+
+        telemetry.addData("Raw detector results",
+                vision.rawDetectionCount);
+        telemetry.addData("Pollen detections",
+                vision.pollenCount);
+
+        telemetry.addData("Left / Center / Right",
+                "%d / %d / %d",
+                vision.leftCount,
+                vision.centerCount,
+                vision.rightCount);
+
+        telemetry.addData("Best sector",
+                vision.bestSector);
+        telemetry.addData("Best sector count",
+                vision.bestSectorCount);
+
+        telemetry.addData("Target horizontal angle",
+                "%.2f degrees", lastTargetAngle);
+
+        telemetry.addData("Forward command",
+                "%.2f", lastForwardCommand);
+        telemetry.addData("Turn command",
+                "%.2f", lastTurnCommand);
+
+        // Informational only: this is NOT a cutoff.
+        telemetry.addData("Elapsed time",
+                "%.1f seconds", autoTimer.seconds());
+
+        telemetry.update();
     }
 
-    // Count only detections whose class is Pollen.
-    // The Limelight's configured threshold remains in effect.
-    private int countPollen() {
+    private VisionObservation readPollen() {
+
+        VisionObservation observation = new VisionObservation();
 
         LLResult result = limelight.getLatestResult();
 
         if (result == null || !result.isValid()) {
-            return 0;
+            return observation;
         }
 
         List<LLResultTypes.DetectorResult> detections =
                 result.getDetectorResults();
 
-        int count = 0;
+        observation.rawDetectionCount = detections.size();
 
+        // Read EVERY detector result instead of only the first ball.
         for (LLResultTypes.DetectorResult detection : detections) {
 
             String className = detection.getClassName();
 
-            if (className != null
-                    && className.equalsIgnoreCase("pollen")) {
-                count++;
+            if (className == null
+                    || !className.equalsIgnoreCase("pollen")) {
+                continue;
+            }
+
+            // Horizontal angle in degrees relative to the camera's
+            // principal pixel, using the Limelight detector API.
+            double targetX =
+                    detection.getTargetXDegreesNoCrosshair();
+
+            observation.pollenCount++;
+
+            if (targetX < LEFT_BOUNDARY) {
+
+                observation.leftCount++;
+                observation.leftAngleSum += targetX;
+
+            } else if (targetX > RIGHT_BOUNDARY) {
+
+                observation.rightCount++;
+                observation.rightAngleSum += targetX;
+
+            } else {
+
+                observation.centerCount++;
+                observation.centerAngleSum += targetX;
             }
         }
 
-        return count;
-    }
+        // Prefer center on ties, then left or right only if the count
+        // is strictly greater.
+        int bestCount = observation.centerCount;
+        double bestAngleSum = observation.centerAngleSum;
+        observation.bestSector = "CENTER";
 
-    // Turn to a heading using IMU feedback.
-    private boolean turnToHeading(double targetHeading) {
+        if (observation.leftCount > bestCount) {
 
-        ElapsedTime turnTimer = new ElapsedTime();
-
-        while (opModeIsActive()
-                && autoTimer.seconds() < AUTO_LIMIT_SECONDS
-                && turnTimer.seconds() < 2.5) {
-
-            double currentHeading =
-                    imu.getRobotYawPitchRollAngles()
-                            .getYaw(AngleUnit.DEGREES);
-
-            double error =
-                    normalizeDegrees(targetHeading - currentHeading);
-
-            if (Math.abs(error) <= TURN_TOLERANCE_DEGREES) {
-                stopDrive();
-                return true;
-            }
-
-            double correction =
-                    Range.clip(
-                            error * TURN_KP,
-                            -MAX_TURN_POWER,
-                            MAX_TURN_POWER
-                    );
-
-            if (Math.abs(correction) < MIN_TURN_POWER) {
-                correction = Math.copySign(MIN_TURN_POWER, correction);
-            }
-
-            // Negative sign matches the standard mecanum mixing below
-            // when the left motors are reversed.
-            driveRobotCentric(0.0, 0.0, -correction);
-
-            sleep(10);
+            bestCount = observation.leftCount;
+            bestAngleSum = observation.leftAngleSum;
+            observation.bestSector = "LEFT";
         }
 
-        stopDrive();
+        if (observation.rightCount > bestCount) {
 
-        return false;
-    }
-
-    // Standard mecanum wheel-power mixing.
-    private void driveRobotCentric(
-            double forward,
-            double strafeRight,
-            double turn) {
-
-        double fl = forward + strafeRight + turn;
-        double fr = forward - strafeRight - turn;
-        double bl = forward - strafeRight + turn;
-        double br = forward + strafeRight - turn;
-
-        double max = Math.max(
-                1.0,
-                Math.max(
-                        Math.max(Math.abs(fl), Math.abs(fr)),
-                        Math.max(Math.abs(bl), Math.abs(br))
-                )
-        );
-
-        frontLeft.setPower(fl / max);
-        frontRight.setPower(fr / max);
-        backLeft.setPower(bl / max);
-        backRight.setPower(br / max);
-    }
-
-    // Move forward for a short, bounded time.
-    private void driveForwardFor(double seconds) {
-
-        ElapsedTime moveTimer = new ElapsedTime();
-
-        while (opModeIsActive()
-                && moveTimer.seconds() < seconds
-                && autoTimer.seconds() < AUTO_LIMIT_SECONDS) {
-
-            driveRobotCentric(DRIVE_POWER, 0.0, 0.0);
-
-            sleep(10);
+            bestCount = observation.rightCount;
+            bestAngleSum = observation.rightAngleSum;
+            observation.bestSector = "RIGHT";
         }
 
-        stopDrive();
-    }
+        observation.bestSectorCount = bestCount;
 
-    private double normalizeDegrees(double angle) {
-
-        while (angle > 180.0) {
-            angle -= 360.0;
+        if (bestCount > 0) {
+            observation.targetAngle =
+                    bestAngleSum / bestCount;
         }
 
-        while (angle <= -180.0) {
-            angle += 360.0;
-        }
-
-        return angle;
+        return observation;
     }
 
-    private void stopDrive() {
+    @Override
+    public void stop() {
 
-        if (frontLeft != null) frontLeft.setPower(0.0);
-        if (frontRight != null) frontRight.setPower(0.0);
-        if (backLeft != null) backLeft.setPower(0.0);
-        if (backRight != null) backRight.setPower(0.0);
+        // Always stop movement when the OpMode is stopped.
+        if (follower != null) {
+            follower.setTeleOpDrive(0.0, 0.0, 0.0, false);
+        }
+
+        if (limelight != null) {
+            limelight.stop();
+        }
     }
 }
