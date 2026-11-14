@@ -30,7 +30,7 @@ public class Teleop extends OpMode {
     @Override
     public void init() {
         follower = Constants.createFollower(hardwareMap);
-        intake = new Intake(hardwareMap);
+        //intake = new Intake(hardwareMap);
         follower.setStartingPose(startingPose == null ? new Pose() : startingPose);
         follower.update();
         telemetryM = PanelsTelemetry.INSTANCE.getTelemetry();
@@ -106,13 +106,13 @@ public class Teleop extends OpMode {
             slowModeMultiplier -= 0.25;
         }
 
-        if (gamepad1.dpad_up){
+        /*if (gamepad1.dpad_up){
             intake.setState(Intake.IntakeState.FORWARD);
         } else if (gamepad1.dpad_down){
             intake.setState(Intake.IntakeState.BACKWARD);
         } else {
             intake.setState(Intake.IntakeState.INIT);
-        }
+        }*/
 
 
         telemetryM.debug("position", follower.getPose());
